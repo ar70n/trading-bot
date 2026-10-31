@@ -27,7 +27,7 @@ vía cron). Con los datos hasta el cierre de ayer:
 
 Con este horario (mañana, no tras el cierre) tanto la entrada como la
 salida se ejecutan el mismo día que la señal lo indica, aceptando el pequeño
-margen de error frente al gap de apertura real. 
+margen de error frente al gap de apertura real.
 
 El stop-loss y la LOC de salida comparten grupo OCA (One-Cancels-All): si
 salta uno se cancela automáticamente el otro.
@@ -37,15 +37,17 @@ import asyncio
 import logging
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
-from ib_async import *
+from ib_async import IB, Index, MarketOrder, Order, OrderStatus, ScannerSubscription, Stock, StopOrder, TagValue
 
-logging.basicConfig(filename="../log/strategy.log", filemode="w", level=logging.INFO)
+from demo_guard import assert_session_is_demo
+from events import emit
+
 logger = logging.getLogger("strategy")
 
-DB_PATH = "trading_state.db"
+DB_PATH = "/home/bot/tradingbot/trading_state.db"
 
 # --- Parámetros de la estrategia (AFL -> Python) ---------------------------
 MAX_POSITIONS = 10
@@ -57,6 +59,10 @@ ATR_PERIOD = 20
 ATR_MULTIPLIER = 2
 BREAKOUT_WINDOW_DAYS = 10
 HV_LOOKBACK_DAYS = 252
+OPEN_ORDERS_TIMEOUT_S = 15
+STOP_CHECK_DELAY_S = 5
+OCA_TYPE = 1  # IB rechaza la LOC con este tipo (error 201). El tipo 3 está pendiente de decisión: ver CLAUDE.md
+MIN_DOLLAR_VOLUME = 5_000_000 # $ diarios mínimos (precio x volumen), media de 20 días
 
 VIX_LOOKBACK_DAYS = 100
 VIX_PERCENTILE_MAX = 85
@@ -112,7 +118,7 @@ def load_watchlist():
 def upsert_watch_entry(entry: dict):
     entry.setdefault("limit_buy", None)
     entry.setdefault("days_in_window", 0)
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.execute(
             """
@@ -145,7 +151,7 @@ def load_positions():
 
 
 def insert_position(pos: dict):
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.execute(
             """
@@ -162,7 +168,7 @@ def insert_position(pos: dict):
 
 
 def update_position(con_id: int, **fields):
-    fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    fields["updated_at"] = datetime.now(UTC).isoformat()
     set_clause = ", ".join(f"{k} = :{k}" for k in fields)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.execute(
@@ -215,6 +221,12 @@ async def compute_annualized_hv(ib: IB, contract):
     )
     if not bars or len(bars) < HV_LOOKBACK_DAYS + 1:
         return None
+    # Check wheter volume is sufficient (average dollar volume over last 20 days)
+    recent = bars[-20:]
+    avg_dollar_volume = sum(b.close * b.volume for b in recent) / len(recent)
+    if avg_dollar_volume < MIN_DOLLAR_VOLUME:
+        return None
+
     closes = [b.close for b in bars[-(HV_LOOKBACK_DAYS + 1):]]
     returns = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes))]
     mean = sum(returns) / len(returns)
@@ -237,6 +249,7 @@ async def get_vix_percentile_ok(ib: IB):
     current = window[-1]
     rank = sum(1 for v in window if v <= current) / len(window) * 100
     ok = rank <= VIX_PERCENTILE_MAX
+    emit("vix.filter", percentile=rank, max_percentile=VIX_PERCENTILE_MAX, entries_allowed=ok)
     logger.info("VIX percentil (%d días) = %.1f%% -> %s", VIX_LOOKBACK_DAYS, rank,
                 "permite nuevas entradas" if ok else "bloquea nuevas entradas")
     return ok
@@ -264,10 +277,11 @@ async def scan_candidates(ib: IB):
         TagValue("priceAbove", "1"),
         TagValue("priceBelow", "100"),
         TagValue("lastVsEMAChangeRatio200Above", "0"),
-        TagValue("marketCapAbove1e6", "100"),
+        TagValue("marketCapAbove1e6", "500"),
         TagValue("avgVolumeAbove", "100000"),
     ]
     results = await ib.reqScannerDataAsync(sub, [], filter_options)
+    emit("scanner.result", scan_code=sub.scanCode, count=len(results))
     logger.info("Scanner: %d contratos encontrados", len(results))
     return results
 
@@ -283,6 +297,7 @@ async def rank_candidates(ib: IB, candidates):
     results = await asyncio.gather(*(hv_for(d) for d in candidates))
     ranked = [r for r in results if r is not None]
     ranked.sort(key=lambda x: x[1])  # HV ascendente == PositionScore (1/HV) descendente
+    emit("scanner.ranked", candidates=len(candidates), ranked=len(ranked))
     return ranked
 
 
@@ -295,6 +310,7 @@ async def update_watch_entry(ib: IB, entry: dict, vix_filter_ok: bool):
     qualified = await ib.qualifyContractsAsync(contract)
     if not qualified:
         logger.warning("No se pudo cualificar %s, se descarta de la watchlist", entry["symbol"])
+        emit("signal.discarded", symbol=entry["symbol"], reason="not_qualified")
         remove_watch_entry(entry["con_id"])
         return
 
@@ -322,6 +338,7 @@ async def update_watch_entry(ib: IB, entry: dict, vix_filter_ok: bool):
                 days_in_window=0,
             )
             upsert_watch_entry(entry)
+            emit("signal.breakout", symbol=entry["symbol"], limit_buy=entry["limit_buy"], atr=atr_last)
             logger.info("%s: ruptura de máximo de %d días; limit_buy=%.2f",
                         entry["symbol"], HH_LOOKBACK_DAYS, entry["limit_buy"])
         return
@@ -335,14 +352,18 @@ async def update_watch_entry(ib: IB, entry: dict, vix_filter_ok: bool):
             if red_candle and vix_filter_ok:
                 atr_prev = get_atr(bars[:-2])  # ATR "del día anterior a la señal"
                 if atr_prev is not None:
+                    emit("signal.entry", symbol=entry["symbol"], limit_buy=entry["limit_buy"], close=last.close)
                     await submit_entry_bracket(ib, contract, entry, atr_prev * ATR_MULTIPLIER, last.close)
             else:
+                emit("signal.discarded", symbol=entry["symbol"], reason="no_red_candle_or_vix",
+                     red_candle=red_candle, vix_ok=vix_filter_ok)
                 logger.info("%s: tocó el nivel de compra pero faltó vela roja/VIX; se descarta",
                             entry["symbol"])
             remove_watch_entry(entry["con_id"])
             return
 
         if entry["days_in_window"] >= BREAKOUT_WINDOW_DAYS:
+            emit("signal.expired", symbol=entry["symbol"], days=entry["days_in_window"])
             logger.info("%s: expiró la ventana de %d días sin tocar el nivel de entrada",
                         entry["symbol"], BREAKOUT_WINDOW_DAYS)
             remove_watch_entry(entry["con_id"])
@@ -376,7 +397,8 @@ async def submit_entry_bracket(ib: IB, contract, entry: dict, stop_distance: flo
     stop.orderId = ib.client.getReqId()
     stop.parentId = parent.orderId
     stop.ocaGroup = oca_group
-    stop.ocaType = 1
+    stop.ocaType = OCA_TYPE
+    stop.tif = "GTC"  # sin esto IB lo trata como DAY y la posición queda sin stop desde el segundo día
     stop.transmit = True
 
     ib.placeOrder(contract, parent)
@@ -392,6 +414,8 @@ async def submit_entry_bracket(ib: IB, contract, entry: dict, stop_distance: flo
         "entry_atr": stop_distance,
         "oca_group": oca_group,
     })
+    emit("order.bracket", symbol=entry["symbol"], qty=quantity, stop_price=stop_price,
+         reference_price=reference_price, equity=equity)
     logger.info("%s: bracket enviado — MOO compra qty=%d, stop en %.2f (referencia %.2f)",
                 entry["symbol"], quantity, stop_price, reference_price)
 
@@ -408,7 +432,7 @@ def build_loc_order(action: str, quantity: int, limit_price: float, oca_group: s
     order.lmtPrice = round(limit_price, 2)
     order.tif = "DAY"
     order.ocaGroup = oca_group
-    order.ocaType = 1
+    order.ocaType = OCA_TYPE
     return order
 
 
@@ -424,14 +448,53 @@ async def update_exit_order(ib: IB, contract, pos: dict, quantity: int):
         return
     threshold = max(bars[-1].close, bars[-2].close)
 
-    order_id = pos["exit_order_id"] or ib.client.getReqId()
+    # Una LOC viva se modifica; una ya terminada no se puede reutilizar (IB: error 103, id duplicado).
+    live_ids = {trade.order.orderId for trade in ib.openTrades()}
+    order_id = pos["exit_order_id"] if pos["exit_order_id"] in live_ids else ib.client.getReqId()
     order = build_loc_order("SELL", quantity, threshold, pos["oca_group"])
     order.orderId = order_id
     ib.placeOrder(contract, order)  # nueva orden si order_id es nuevo, modificación si ya existía
 
     if pos["exit_order_id"] != order_id:
         update_position(pos["con_id"], exit_order_id=order_id)
+    emit("order.exit_updated", symbol=pos["symbol"], limit=threshold, qty=quantity)
     logger.info("%s: LOC de venta actualizada a %.2f para el cierre de hoy", pos["symbol"], threshold)
+
+
+async def replace_missing_stop(ib: IB, contract, pos: dict, ib_pos):
+    """Repone el stop perdido al nivel de entrada real menos la distancia original, en un grupo OCA nuevo:
+    IB no admite reutilizar uno terminado, y la LOC de hoy entra en el mismo grupo que este stop.
+    Devuelve la orden enviada, o None si no se repuso. Mira todos los clientes: un stop ajeno también cuenta."""
+    con_id = pos["con_id"]
+    try:
+        open_trades = await asyncio.wait_for(ib.reqAllOpenOrdersAsync(), OPEN_ORDERS_TIMEOUT_S)
+    except TimeoutError:
+        emit("position.stop_missing", level=logging.CRITICAL, symbol=pos["symbol"],
+             stop_order_id=pos["stop_order_id"], qty=ib_pos.position, reason="IB no devolvió las órdenes")
+        return None
+    has_sell_stop = any(
+        t.contract.conId == con_id and t.order.action == "SELL" and t.order.orderType.startswith("STP")
+        for t in open_trades
+    )
+    stop_price = round(ib_pos.avgCost - (pos["entry_atr"] or 0), 2)
+    if has_sell_stop or not pos["entry_atr"] or stop_price <= 0:
+        emit("position.stop_missing", level=logging.CRITICAL, symbol=pos["symbol"],
+             stop_order_id=pos["stop_order_id"], qty=ib_pos.position,
+             reason="otro stop de venta vivo" if has_sell_stop else "sin datos para calcular el nivel")
+        return None
+
+    stop = StopOrder("SELL", int(ib_pos.position), stop_price)
+    stop.orderId = ib.client.getReqId()
+    stop.ocaGroup = f"pos_{con_id}_{stop.orderId}"
+    stop.ocaType = OCA_TYPE
+    stop.tif = "GTC"
+    trade = ib.placeOrder(contract, stop)
+
+    update_position(con_id, stop_order_id=stop.orderId, oca_group=stop.ocaGroup, exit_order_id=None)
+    pos.update(stop_order_id=stop.orderId, oca_group=stop.ocaGroup, exit_order_id=None)
+    emit("position.stop_replaced", level=logging.WARNING, symbol=pos["symbol"], order_id=stop.orderId,
+         stop_price=stop_price, qty=ib_pos.position)
+    return trade
 
 
 async def sync_positions(ib: IB):
@@ -439,21 +502,65 @@ async def sync_positions(ib: IB):
     ejecutarse, o ya cerró por stop/LOC), se limpia. Si sigue abierta, se
     actualiza su LOC de salida con el umbral de hoy."""
     tracked = load_positions()
-    if not tracked:
+    # Sin una lista fresca de órdenes no se decide nada: cancelar o reponer a ciegas podría dejar sin stop o duplicarlo.
+    try:
+        await asyncio.wait_for(ib.reqOpenOrdersAsync(), OPEN_ORDERS_TIMEOUT_S)
+    except TimeoutError:
+        emit("positions.sync_skipped", level=logging.ERROR, tracked=len(tracked))
         return
 
     ib_positions = {p.contract.conId: p for p in await ib.reqPositionsAsync() if p.position != 0}
 
+    # La estrategia es solo largos: un corto solo puede venir de un solape de órdenes. No se opera sobre él.
+    short_ids = {con_id for con_id, p in ib_positions.items() if p.position < 0}
+    for con_id in sorted(short_ids):
+        p = ib_positions[con_id]
+        emit("position.short_detected", level=logging.CRITICAL, con_id=con_id,
+             symbol=p.contract.symbol, qty=p.position)
+
+    live_orders = {trade.order.orderId: trade.order for trade in ib.openTrades()}
+
+    # Una posición larga que el bot no sigue no tiene quien la proteja ni la cierre.
+    tracked_ids = {pos["con_id"] for pos in tracked}
+    for con_id, p in sorted(ib_positions.items()):
+        if p.position > 0 and con_id not in tracked_ids:
+            emit("position.untracked_long", level=logging.CRITICAL, con_id=con_id,
+                 symbol=p.contract.symbol, qty=p.position)
+
     for pos in tracked:
         ib_pos = ib_positions.get(pos["con_id"])
         if ib_pos is None:
+            # Sin posición, un stop GTC vivo queda huérfano y al saltar abriría un corto.
+            # Con la compra madre aún viva no es huérfano: la entrada todavía no se ha ejecutado.
+            orphan = live_orders.get(pos["stop_order_id"])
+            if orphan is not None and orphan.parentId in live_orders:
+                continue
+            if orphan is not None:
+                ib.cancelOrder(orphan)
+                emit("position.orphan_stop_cancelled", level=logging.WARNING, symbol=pos["symbol"],
+                     order_id=orphan.orderId)
             logger.info("%s: sin posición abierta en IB; se limpia el tracking", pos["symbol"])
+            emit("position.untracked", symbol=pos["symbol"], reason="no_position_in_ib")
             remove_position(pos["con_id"])
+            continue
+
+        if pos["con_id"] in short_ids:
             continue
 
         contract = Stock(conId=pos["con_id"], exchange=pos["exchange"], currency=pos["currency"])
         await ib.qualifyContractsAsync(contract)
+        replaced = None
+        if pos["stop_order_id"] not in live_orders:
+            replaced = await replace_missing_stop(ib, contract, pos, ib_pos)
         await update_exit_order(ib, contract, pos, int(abs(ib_pos.position)))
+
+        # Sin probar contra IB: que el rechazo de la LOC o del propio stop lo mate debe saberse hoy, no mañana.
+        if replaced is not None:
+            await asyncio.sleep(STOP_CHECK_DELAY_S)
+            if replaced.orderStatus.status in OrderStatus.DoneStates:
+                emit("position.stop_missing", level=logging.CRITICAL, symbol=pos["symbol"],
+                     stop_order_id=pos["stop_order_id"], qty=ib_pos.position,
+                     reason=f"stop repuesto terminado: {replaced.orderStatus.status}")
 
 async def is_trading_day(ib: IB) -> bool:
     """Comprueba si hoy hay sesión abierta usando el calendario de negociación
@@ -464,27 +571,29 @@ async def is_trading_day(ib: IB) -> bool:
     if not details:
         logger.warning("No se pudo obtener el calendario de negociación; se asume mercado abierto")
         return True
- 
+
     tz = ZoneInfo(details[0].timeZoneId)
     today_str = datetime.now(tz).strftime("%Y%m%d")
- 
+
     for session in details[0].tradingHours.split(";"):
         if session.startswith(today_str):
             return "CLOSED" not in session
- 
+
     logger.warning("No se encontró la sesión de hoy (%s) en tradingHours; se asume mercado abierto", today_str)
     return True
-    
+
 # ---------------------------------------------------------------------------
 # Ejecución diaria (pensada para correr por la mañana, antes de la apertura)
 # ---------------------------------------------------------------------------
 
 async def run_once(ib: IB):
     logger.info("=== Ejecución diaria iniciada (antes de la apertura) ===")
+    assert_session_is_demo(ib)  # segunda barrera: también si se llama a run_once sin pasar por bot.py
     init_db()
 
     if not await is_trading_day(ib):
         logger.info("Hoy el mercado está cerrado (festivo/fin de semana); no se hace nada")
+        emit("run.market_closed")
         return
 
     # 1) Posiciones ya abiertas: limpiar tracking obsoleto y refrescar la LOC de salida
@@ -501,6 +610,7 @@ async def run_once(ib: IB):
         try:
             await update_watch_entry(ib, entry, vix_ok)
         except Exception:
+            emit("strategy.entry_error", level=logging.ERROR, exc_info=True, symbol=entry["symbol"])
             logger.exception("Error procesando %s", entry["symbol"])
 
     # 4) Si hay huecos, buscar candidatos nuevos
@@ -537,6 +647,7 @@ async def run_once(ib: IB):
         })
         added += 1
 
+    emit("watchlist.updated", added=added, size=len(load_watchlist()), positions=len(load_positions()))
     logger.info("Añadidos %d candidatos nuevos a la watchlist", added)
     logger.info("=== Ejecución diaria terminada ===")
 
