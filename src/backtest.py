@@ -11,12 +11,13 @@ CSV: un archivo por símbolo (SIMBOLO.csv) más VIX.csv, con columnas date,open,
 Modelo de ejecución (mismo horario que producción: run_once corre antes de la apertura con barras hasta ayer):
 - MOO (tif OPG): se ejecuta a la apertura; activa sus órdenes hijas.
 - STP: se dispara si low <= stop; con gap a la baja se ejecuta a la apertura.
-- LOC de venta: se ejecuta al cierre si close >= límite. Con ocaType 1 o 2 se rechaza, como hace IB (error 201).
+- LMT de venta (take profit): se ejecuta si high >= límite, al límite o a la apertura si abre por encima. Si el mismo
+  día se tocan el stop y el límite, se ejecuta el stop: el orden real dentro de la barra no se conoce.
 - OCA: al ejecutarse una, se cancelan las demás del grupo.
 - tif DAY o vacío: la orden expira al cierre, igual que en IB. No se simulan comisiones ni deslizamiento.
 
-Limitaciones: el escáner es una aproximación (precio entre 1 y 100, cercanía al máximo de 13 semanas, top 50) y los
-datos sintéticos no predicen rentabilidad real. Sirve para regresión y para validar mecánica, no para estimar retornos.
+El universo del cribado son todos los símbolos del mercado simulado. Limitación: los datos sintéticos no predicen
+rentabilidad real. Sirve para regresión y para validar mecánica, no para estimar retornos.
 """
 
 from __future__ import annotations
@@ -42,8 +43,6 @@ from ib_async import BarData
 
 import strategy
 
-SCAN_SIZE = 50
-SCAN_LOOKBACK = 63
 INITIAL_EQUITY = 10_000.0  # igual que InitialEquity en docs/strategy.txt
 TIMEZONE = "US/Eastern"
 DURATION_SESSIONS = {"Y": 252, "M": 21, "W": 5, "D": 1}
@@ -150,14 +149,7 @@ def load_csv_market(directory: Path) -> dict[str, list[BarData]]:
         with path.open(newline="") as handle:
             rows = sorted(csv.DictReader(handle), key=lambda r: r["date"])
         market[path.stem.upper()] = [
-            _bar(
-                date.fromisoformat(r["date"]),
-                float(r["open"]),
-                float(r["high"]),
-                float(r["low"]),
-                float(r["close"]),
-                float(r["volume"]),
-            )
+            _bar(date.fromisoformat(r["date"]), *(float(r[k]) for k in ("open", "high", "low", "close", "volume")))
             for r in rows
         ]
     if "VIX" not in market:
@@ -209,36 +201,14 @@ class SimIB:
         for contract in contracts:
             if contract.conId in self.by_con_id:
                 contract.symbol = self.by_con_id[contract.conId]
+            elif contract.symbol in self.con_ids:
+                contract.conId = self.con_ids[contract.symbol]
         return list(contracts)
 
     async def reqHistoricalDataAsync(self, contract: Any, **kwargs: Any) -> list[BarData]:  # noqa: N802
         symbol = "VIX" if contract.symbol == "VIX" else self.by_con_id[contract.conId]
         amount, unit = kwargs["durationStr"].split()
         return self._history(symbol)[-int(amount) * DURATION_SESSIONS[unit] :]
-
-    async def reqScannerDataAsync(self, *args: Any) -> list[Any]:  # noqa: N802
-        scored = []
-        for symbol in self.symbols:
-            history = self._history(symbol)
-            if len(history) < SCAN_LOOKBACK or not 1 < history[-1].close < 100:
-                continue
-            top = max(b.high for b in history[-SCAN_LOOKBACK:])
-            scored.append((history[-1].close / top, symbol))
-        scored.sort(key=lambda item: (-item[0], item[1]))
-        return [
-            SimpleNamespace(
-                contractDetails=SimpleNamespace(
-                    contract=SimpleNamespace(
-                        conId=self.con_ids[symbol],
-                        symbol=symbol,
-                        exchange="SMART",
-                        primaryExchange="SIM",
-                        currency="USD",
-                    )
-                )
-            )
-            for _, symbol in scored[:SCAN_SIZE]
-        ]
 
     async def accountSummaryAsync(self) -> list[Any]:  # noqa: N802
         return [SimpleNamespace(tag="NetLiquidation", value=str(self.mark_to_market()))]
@@ -263,13 +233,14 @@ class SimIB:
         ]
 
     def placeOrder(self, contract: Any, order: Any) -> None:  # noqa: N802
-        if order.orderType == "LOC" and order.ocaGroup and order.ocaType in (1, 2):
-            self.rejected_orders += 1  # IB: error 201 "Invalid OCA handling method", comprobado en demo
-            return
         if order.orderId in self.seen_ids and order.orderId not in self.orders:
             self.rejected_orders += 1  # IB: error 103 "Duplicate order id", comprobado en demo
             return
         self.seen_ids.add(order.orderId)
+        live = self.orders.get(order.orderId)
+        if live is not None:  # modificación: una hija ya activada sigue activa, como en IB
+            live["order"] = order
+            return
         self.orders[order.orderId] = {"con_id": contract.conId, "order": order, "active": order.parentId == 0}
 
     def cancelOrder(self, order: Any) -> None:  # noqa: N802
@@ -309,13 +280,30 @@ class SimIB:
             )
         )
 
+    def _today_bar(self, con_id: int) -> BarData | None:
+        return self.by_date[self.by_con_id[con_id]].get(self.today)
+
+    def _fill_exits(self, order_type: str, reason: str, fill_price: Any) -> None:
+        for order_id, record in sorted(self.orders.items()):
+            order = record["order"]
+            if order.orderType != order_type or order_id not in self.orders or not record["active"]:
+                continue
+            if record["con_id"] not in self.positions:
+                continue
+            bar = self._today_bar(record["con_id"])
+            price = fill_price(order, bar) if bar is not None else None
+            if price is not None:
+                self._exit(record["con_id"], price, reason)
+                del self.orders[order_id]
+                self._cancel_oca(order.ocaGroup, order_id)
+
     def simulate_session(self) -> None:
         """Ejecuta las órdenes vivas contra la barra de hoy, en orden cronológico: apertura, sesión, cierre."""
         for order_id, record in sorted(self.orders.items()):
             order = record["order"]
             if order.tif != "OPG" or order_id not in self.orders:
                 continue
-            bar = self.by_date[self.by_con_id[record["con_id"]]].get(self.today)
+            bar = self._today_bar(record["con_id"])
             del self.orders[order_id]
             if bar is None:
                 for child_id in [i for i, o in self.orders.items() if o["order"].parentId == order_id]:
@@ -334,29 +322,8 @@ class SimIB:
         protected = {r["con_id"] for r in self.orders.values() if r["active"] and r["order"].orderType == "STP"}
         self.unprotected_days += sum(1 for con_id in self.positions if con_id not in protected)
 
-        for order_id, record in sorted(self.orders.items()):
-            order = record["order"]
-            if order.orderType != "STP" or order_id not in self.orders or not record["active"]:
-                continue
-            if record["con_id"] not in self.positions:
-                continue
-            bar = self.by_date[self.by_con_id[record["con_id"]]].get(self.today)
-            if bar is not None and bar.low <= order.auxPrice:
-                self._exit(record["con_id"], min(order.auxPrice, bar.open), "stop")
-                del self.orders[order_id]
-                self._cancel_oca(order.ocaGroup, order_id)
-
-        for order_id, record in sorted(self.orders.items()):
-            order = record["order"]
-            if order.orderType != "LOC" or order_id not in self.orders:
-                continue
-            if record["con_id"] not in self.positions:
-                continue
-            bar = self.by_date[self.by_con_id[record["con_id"]]].get(self.today)
-            if bar is not None and bar.close >= order.lmtPrice:
-                self._exit(record["con_id"], bar.close, "loc")
-                del self.orders[order_id]
-                self._cancel_oca(order.ocaGroup, order_id)
+        self._fill_exits("STP", "stop", lambda o, b: min(o.auxPrice, b.open) if b.low <= o.auxPrice else None)
+        self._fill_exits("LMT", "take_profit", lambda o, b: max(o.lmtPrice, b.open) if b.high >= o.lmtPrice else None)
 
         # tif vacío o DAY: expira al cierre, como en IB.
         self.orders = {i: r for i, r in self.orders.items() if r["order"].tif not in ("", "DAY")}
@@ -380,7 +347,7 @@ async def _run(market: dict[str, list[BarData]], warmup: int, equity: float) -> 
     curve = []
     for index in range(warmup, len(sim.calendar)):
         sim.today_index = index
-        await strategy.run_once(sim)
+        await strategy.run_once(sim, universe=sim.symbols)
         sim.simulate_session()
         curve.append(sim.mark_to_market())
     return BacktestResult(

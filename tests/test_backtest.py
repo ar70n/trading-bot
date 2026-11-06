@@ -15,7 +15,7 @@ from backtest import SimIB, load_csv_market, run_backtest, synthetic_market
 
 # Si cambia, ha cambiado el comportamiento de la estrategia o del simulador: no actualizar sin explicar por qué.
 GOLDEN_SEED, GOLDEN_SYMBOLS, GOLDEN_DAYS = 42, 30, 800
-GOLDEN_FINGERPRINT = "de85816d7c4611d1"
+GOLDEN_FINGERPRINT = "c48b646a30aeb59a"
 
 
 @pytest.fixture(scope="module")
@@ -138,27 +138,26 @@ def test_stop_fills_at_stop_price_without_gap():
     assert sim.trades[0].exit_price == 45
 
 
-def test_loc_fills_only_if_close_reaches_limit():
-    sim = _sim((50, 56, 49, 55))
+@pytest.mark.parametrize(
+    "bar_,exit_price",
+    [((50, 56, 49, 53), 54.0), ((57, 58, 56, 57), 57), ((50, 53, 49, 52), None)],
+    ids=["touched_intraday", "gap_above_fills_at_open", "not_reached"],
+)
+def test_take_profit_fills_when_high_reaches_limit(bar_, exit_price):
+    sim = _sim(bar_)
     _hold(sim)
-    sim.placeOrder(_contract(), _order(3, "LOC", tif="DAY", lmtPrice=54.0))
+    sim.placeOrder(_contract(), _order(3, "LMT", tif="GTC", lmtPrice=54.0))
     sim.simulate_session()
-    assert (sim.trades[0].exit_price, sim.trades[0].exit_reason) == (55, "loc")
-
-    sim = _sim((50, 56, 49, 53))
-    _hold(sim)
-    sim.placeOrder(_contract(), _order(3, "LOC", tif="DAY", lmtPrice=54.0))
-    sim.simulate_session()
-    assert sim.trades == []
+    assert [(t.exit_price, t.exit_reason) for t in sim.trades] == ([(exit_price, "take_profit")] if exit_price else [])
 
 
 def test_oca_cancels_sibling():
     sim = _sim((50, 51, 44, 55))
     _hold(sim)
     sim.placeOrder(_contract(), _order(2, "STP", tif="GTC", auxPrice=45.0))
-    sim.placeOrder(_contract(), _order(3, "LOC", tif="GTC", lmtPrice=54.0))
+    sim.placeOrder(_contract(), _order(3, "LMT", tif="GTC", lmtPrice=54.0))
     sim.simulate_session()
-    assert len(sim.trades) == 1 and sim.trades[0].exit_reason == "stop"
+    assert len(sim.trades) == 1 and sim.trades[0].exit_reason == "stop"  # mismo día: el stop, por prudencia
     assert sim.orders == {}
 
 
@@ -186,23 +185,29 @@ def test_every_position_keeps_a_live_stop(golden_market):
     assert run_backtest(golden_market).unprotected_position_days == 0
 
 
-def test_known_issue_exit_orders_are_rejected(golden_market):
-    """DEFECTO CONOCIDO: con ocaType 1 ninguna LOC llega a vivir. Al resolverlo, debe ser 0."""
+def test_exits_are_accepted_and_used(golden_market):
     result = run_backtest(golden_market)
-    assert result.rejected_orders > 0
-    assert {t.exit_reason for t in result.trades} <= {"stop"}
+    assert result.rejected_orders == 0
+    assert {t.exit_reason for t in result.trades} == {"stop", "take_profit"}
 
 
-def test_simulator_rejects_what_ib_rejects():
+def test_simulator_rejects_reused_order_id():
     sim = _sim((50, 56, 49, 55))
-    bad = _order(3, "LOC", tif="DAY", lmtPrice=54.0)
-    bad.ocaType = 1
-    sim.placeOrder(_contract(), bad)
+    order = _order(4, "LMT", tif="GTC", lmtPrice=54.0)
+    sim.placeOrder(_contract(), order)
+    del sim.orders[4]
+    sim.placeOrder(_contract(), order)  # id de una orden ya terminada: IB da el error 103
     assert sim.rejected_orders == 1 and sim.orders == {}
 
-    good = _order(4, "LOC", tif="DAY", lmtPrice=54.0)
-    good.ocaType = 3
-    sim.placeOrder(_contract(), good)
-    del sim.orders[4]
-    sim.placeOrder(_contract(), good)  # id de una orden ya terminada
-    assert sim.rejected_orders == 2 and sim.orders == {}
+
+def test_modifying_an_active_child_keeps_it_active():
+    sim = _sim((50, 56, 49, 53))
+    _hold(sim)
+    child = _order(3, "LMT", tif="GTC", lmtPrice=60.0)
+    sim.placeOrder(_contract(), child)
+    sim.orders[3]["active"] = True
+    child.parentId = 2
+    child.lmtPrice = 54.0
+    sim.placeOrder(_contract(), child)
+    sim.simulate_session()
+    assert [t.exit_reason for t in sim.trades] == ["take_profit"]

@@ -6,7 +6,6 @@ import itertools
 from collections.abc import Sequence
 from datetime import date, timedelta
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 from eventkit import Event
@@ -48,7 +47,6 @@ def make_mock_ib(accounts: Sequence[str] = (DEMO_ACCOUNT,), equity: float = 100_
     ib.reqPositionsAsync.return_value = []
     ib.reqOpenOrdersAsync.return_value = []
     ib.reqAllOpenOrdersAsync.return_value = []
-    ib.reqScannerDataAsync.return_value = []
     ib.reqHistoricalDataAsync.return_value = []
     ib.reqContractDetailsAsync.return_value = []
     return ib
@@ -62,10 +60,3 @@ def bar(open_: float, high: float, low: float, close: float, volume: float = 1_0
 def flat_bars(count: int = 100, price: float = 50.0) -> list[BarData]:
     """Barras planas: high-low = 2, por lo que el ATR es exactamente 2."""
     return [bar(price, price + 1, price - 1, price, day=i) for i in range(count)]
-
-
-def scanner_row(con_id: int, symbol: str, exchange: str = "SMART", currency: str = "USD") -> Any:
-    contract = SimpleNamespace(
-        conId=con_id, symbol=symbol, exchange=exchange, primaryExchange="NYSE", currency=currency
-    )
-    return SimpleNamespace(contractDetails=SimpleNamespace(contract=contract))

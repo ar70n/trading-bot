@@ -68,6 +68,12 @@ def test_secrets_and_accounts_are_redacted(log_path):
     assert mask_account("DU1234567") == "DU***567"
 
 
+def test_guard_passed_count_is_not_redacted(log_path):
+    emit("x", event_counts={"guard.passed": 1, "passphrase": "hunter2", "passwd": "hunter2"})
+    counts = read(log_path)[0]["event_counts"]
+    assert counts == {"guard.passed": 1, "passphrase": "***", "passwd": "***"}
+
+
 def test_exception_is_structured(log_path):
     try:
         raise ValueError("boom")

@@ -5,7 +5,7 @@ requires-python = ">=3.13"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src", "tests", ".claude/hooks"]
+pythonpath = ["src", "tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "-q"
@@ -14,17 +14,15 @@ addopts = "-q"
 line-length = 120
 target-version = "py313"
 src = ["src", "tests"]
-# bridge.py y monitor.py son legado inactivo (monitor está comentado en bot.py).
-extend-exclude = ["src/bridge.py", "src/monitor.py", "installers", "venv"]
+extend-exclude = ["installers", "venv"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "W"]
 
 [tool.mypy]
 python_version = "3.13"
-files = ["src", "tests", ".claude/hooks", "scripts", "ops"]
-exclude = ["src/bridge\\.py$", "src/monitor\\.py$"]
-mypy_path = "src:tests:.claude/hooks"
+files = ["src", "tests"]
+mypy_path = "src:tests"
 explicit_package_bases = true
 ignore_missing_imports = true
 warn_unused_ignores = true

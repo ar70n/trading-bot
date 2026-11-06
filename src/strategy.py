@@ -18,18 +18,18 @@ vía cron). Con los datos hasta el cierre de ayer:
     se disparó la señal (proxy razonable del precio de apertura de hoy,
     ya que el ATR es una distancia fija, no algo anclado al precio exacto
     de fill).
-  - La regla de salida (Sell = C > Ref(HHV(C,2),-1)) se implementa con una
-    orden Limit-on-Close (LOC): el umbral (máximo de los 2 cierres más
-    recientes ya conocidos) se calcula por la mañana y se envía/actualiza
-    como límite de una LOC para el cierre de HOY. IB resuelve la condición
-    "vender si el cierre supera X" en la subasta de cierre sin intervención
-    del bot.
+  - La regla de salida (Sell = C > Ref(HHV(C,2),-1)) se aproxima con un
+    take profit: una orden límite de venta GTC al umbral (máximo de los 2
+    cierres más recientes ya conocidos), cuyo precio se modifica cada mañana.
+    Decisión del usuario del 6/11/2026: el AFL vende al cierre si el cierre
+    supera el umbral; el take profit vende en cuanto el precio lo toca. La
+    LOC equivalente no se podía combinar con el stop en un grupo OCA en IB.
 
 Con este horario (mañana, no tras el cierre) tanto la entrada como la
 salida se ejecutan el mismo día que la señal lo indica, aceptando el pequeño
 margen de error frente al gap de apertura real.
 
-El stop-loss y la LOC de salida comparten grupo OCA (One-Cancels-All): si
+El stop-loss y el take profit comparten grupo OCA (One-Cancels-All): si
 salta uno se cancela automáticamente el otro.
 """
 
@@ -38,9 +38,10 @@ import logging
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from ib_async import IB, Index, MarketOrder, Order, OrderStatus, ScannerSubscription, Stock, StopOrder, TagValue
+from ib_async import IB, Index, MarketOrder, Order, OrderStatus, Stock, StopOrder
 
 from demo_guard import assert_session_is_demo
 from events import emit
@@ -61,8 +62,12 @@ BREAKOUT_WINDOW_DAYS = 10
 HV_LOOKBACK_DAYS = 252
 OPEN_ORDERS_TIMEOUT_S = 15
 STOP_CHECK_DELAY_S = 5
-OCA_TYPE = 1  # IB rechaza la LOC con este tipo (error 201). El tipo 3 está pendiente de decisión: ver CLAUDE.md
-MIN_DOLLAR_VOLUME = 5_000_000 # $ diarios mínimos (precio x volumen), media de 20 días
+OCA_TYPE = 1  # bracket clásico: al ejecutarse el stop o el take profit, IB cancela el otro
+
+# Cribado propio: el AFL se evalúa sobre barras diarias de un universo fijo, sin escáner de IB ni filtros añadidos
+UNIVERSE_FILE = Path(__file__).with_name("sp500.txt")
+HISTORY_DURATION = "2 Y"  # cubre HV (252 + 1 cierres) y el arranque del ATR de Wilder
+SCAN_CONCURRENCY = 20     # peticiones de histórico simultáneas; IB admite hasta 50
 
 VIX_LOOKBACK_DAYS = 100
 VIX_PERCENTILE_MAX = 85
@@ -72,24 +77,22 @@ VIX_PERCENTILE_MAX = 85
 # Persistencia (SQLite)
 # ---------------------------------------------------------------------------
 
-def init_db():
+def _write(*statements: tuple) -> None:
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS watchlist (
-                con_id INTEGER PRIMARY KEY,
-                symbol TEXT NOT NULL,
-                exchange TEXT NOT NULL,
-                currency TEXT NOT NULL,
-                phase TEXT NOT NULL,          -- 'breakout_wait' | 'entry_wait'
-                limit_buy REAL,
-                days_in_window INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
+        for statement in statements:
+            conn.execute(*statement)
+        conn.commit()
+
+
+def _load_all(table: str) -> list[dict]:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        return [dict(r) for r in conn.execute(f"SELECT * FROM {table}").fetchall()]
+
+
+def init_db():
+    _write(
+        (
             """
             CREATE TABLE IF NOT EXISTS positions (
                 con_id INTEGER PRIMARY KEY,
@@ -103,130 +106,104 @@ def init_db():
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
-            """
-        )
-        conn.commit()
-
-
-def load_watchlist():
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("SELECT * FROM watchlist").fetchall()
-        return [dict(r) for r in rows]
-
-
-def upsert_watch_entry(entry: dict):
-    entry.setdefault("limit_buy", None)
-    entry.setdefault("days_in_window", 0)
-    now = datetime.now(UTC).isoformat()
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute(
-            """
-            INSERT INTO watchlist
-                (con_id, symbol, exchange, currency, phase, limit_buy, days_in_window, created_at, updated_at)
-            VALUES
-                (:con_id, :symbol, :exchange, :currency, :phase, :limit_buy, :days_in_window, :now, :now)
-            ON CONFLICT(con_id) DO UPDATE SET
-                phase = excluded.phase,
-                limit_buy = excluded.limit_buy,
-                days_in_window = excluded.days_in_window,
-                updated_at = excluded.updated_at
             """,
-            {**entry, "now": now},
-        )
-        conn.commit()
-
-
-def remove_watch_entry(con_id: int):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute("DELETE FROM watchlist WHERE con_id = ?", (con_id,))
-        conn.commit()
+        ),
+    )
 
 
 def load_positions():
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("SELECT * FROM positions").fetchall()
-        return [dict(r) for r in rows]
+    return _load_all("positions")
 
 
 def insert_position(pos: dict):
     now = datetime.now(UTC).isoformat()
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute(
-            """
-            INSERT INTO positions
-                (con_id, symbol, exchange, currency, stop_order_id, exit_order_id,
-                 entry_atr, oca_group, created_at, updated_at)
-            VALUES
-                (:con_id, :symbol, :exchange, :currency, :stop_order_id, :exit_order_id,
-                 :entry_atr, :oca_group, :now, :now)
-            """,
-            {**pos, "now": now},
-        )
-        conn.commit()
+    _write((
+        """
+        INSERT INTO positions
+            (con_id, symbol, exchange, currency, stop_order_id, exit_order_id,
+             entry_atr, oca_group, created_at, updated_at)
+        VALUES
+            (:con_id, :symbol, :exchange, :currency, :stop_order_id, :exit_order_id,
+             :entry_atr, :oca_group, :now, :now)
+        """,
+        {**pos, "now": now},
+    ))
 
 
 def update_position(con_id: int, **fields):
     fields["updated_at"] = datetime.now(UTC).isoformat()
     set_clause = ", ".join(f"{k} = :{k}" for k in fields)
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute(
-            f"UPDATE positions SET {set_clause} WHERE con_id = :con_id",
-            {**fields, "con_id": con_id},
-        )
-        conn.commit()
+    _write((f"UPDATE positions SET {set_clause} WHERE con_id = :con_id", {**fields, "con_id": con_id}))
 
 
 def remove_position(con_id: int):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute("DELETE FROM positions WHERE con_id = ?", (con_id,))
-        conn.commit()
+    _write(("DELETE FROM positions WHERE con_id = ?", (con_id,)))
 
 
 # ---------------------------------------------------------------------------
 # Indicadores
 # ---------------------------------------------------------------------------
 
-def get_atr(bars, period=ATR_PERIOD):
-    """Wilder's ATR (sin multiplicar). Síncrona: no hace IO."""
-    if len(bars) < period + 1:
-        return None
-    trs = []
+def atr_series(bars, period=ATR_PERIOD):
+    """ATR de Wilder (sin multiplicar) en cada barra; None mientras no hay `period` rangos verdaderos."""
+    series = [None] * len(bars)
+    true_ranges = []
+    atr = None
     for i in range(1, len(bars)):
         high, low, prev_close = bars[i].high, bars[i].low, bars[i - 1].close
-        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
-    if len(trs) <= period:
-        return sum(trs) / len(trs)
-    atr = sum(trs[:period]) / period
-    for tr in trs[period:]:
-        atr = (atr * (period - 1) + tr) / period
-    return atr
+        true_ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+        if len(true_ranges) == period:
+            atr = sum(true_ranges) / period
+        elif atr is not None:
+            atr = (atr * (period - 1) + true_ranges[-1]) / period
+        series[i] = atr
+    return series
 
 
-def get_rolling_hh(bars, lookback=HH_LOOKBACK_DAYS):
-    """Máximo de 'high' de los `lookback` días ANTERIORES a la última barra
-    (equivalente a Ref(HHV(H, lookback), -1) en AFL)."""
-    if len(bars) < lookback + 1:
+def entry_signal(bars):
+    """Buy del AFL en la última barra, sin el filtro del VIX. Devuelve SLatentry = Ref(ATRvar, -1) o None.
+
+        H_breakout = H > Ref(HHV(H, 63), -1);  H_breakout_count = BarsSince(H_breakout) < 10
+        Limit_buy:  L - ATRvar en cada ruptura; se mantiene en la ventana; se anula si L < Ref(Limit_buy, -1)
+        Buy = H_breakout_count && L < Ref(Limit_buy, -1) && C < O
+    """
+    if len(bars) < HH_LOOKBACK_DAYS + 2:
         return None
-    prior_bars = bars[:-1]
-    return max(b.high for b in prior_bars[-lookback:])
+    atr = atr_series(bars)
+    limit_buy = [None] * len(bars)
+    last_breakout = None
+    # Solo cuentan las rupturas de la ventana: una anterior no deja nivel ni en la penúltima barra ni en la última.
+    for i in range(max(HH_LOOKBACK_DAYS, len(bars) - BREAKOUT_WINDOW_DAYS - 1), len(bars)):
+        breakout = bars[i].high > max(b.high for b in bars[i - HH_LOOKBACK_DAYS : i])
+        previous = limit_buy[i - 1]
+        if breakout:
+            last_breakout = i
+            limit_buy[i] = None if atr[i] is None else bars[i].low - atr[i] * ATR_MULTIPLIER
+        elif last_breakout is not None and i - last_breakout < BREAKOUT_WINDOW_DAYS:
+            limit_buy[i] = previous
+        if previous is not None and bars[i].low < previous:
+            limit_buy[i] = None
+
+    last = len(bars) - 1
+    in_window = last_breakout is not None and last - last_breakout < BREAKOUT_WINDOW_DAYS
+    previous = limit_buy[last - 1]
+    buy = in_window and previous is not None and bars[last].low < previous and bars[last].close < bars[last].open
+    if not buy or atr[last - 1] is None:
+        return None
+    return atr[last - 1] * ATR_MULTIPLIER
 
 
-async def compute_annualized_hv(ib: IB, contract):
-    """HV = StDev(ROC(C,1), 252) * sqrt(252)."""
-    bars = await ib.reqHistoricalDataAsync(
-        contract, endDateTime="", durationStr="2 Y", barSizeSetting="1 day",
+async def get_daily_bars(ib: IB, contract, duration: str):
+    return await ib.reqHistoricalDataAsync(
+        contract, endDateTime="", durationStr=duration, barSizeSetting="1 day",
         whatToShow="TRADES", useRTH=True, formatDate=1,
     )
-    if not bars or len(bars) < HV_LOOKBACK_DAYS + 1:
-        return None
-    # Check wheter volume is sufficient (average dollar volume over last 20 days)
-    recent = bars[-20:]
-    avg_dollar_volume = sum(b.close * b.volume for b in recent) / len(recent)
-    if avg_dollar_volume < MIN_DOLLAR_VOLUME:
-        return None
 
+
+def annualized_hv(bars):
+    """HV = StDev(ROC(C,1), 252) * sqrt(252)."""
+    if len(bars) < HV_LOOKBACK_DAYS + 1:
+        return None
     closes = [b.close for b in bars[-(HV_LOOKBACK_DAYS + 1):]]
     returns = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes))]
     mean = sum(returns) / len(returns)
@@ -238,10 +215,7 @@ async def get_vix_percentile_ok(ib: IB):
     """VIXfilter = PercentRank(C, 100) <= 85."""
     vix = Index("VIX", "CBOE")
     await ib.qualifyContractsAsync(vix)
-    bars = await ib.reqHistoricalDataAsync(
-        vix, endDateTime="", durationStr="150 D", barSizeSetting="1 day",
-        whatToShow="TRADES", useRTH=True, formatDate=1,
-    )
+    bars = await get_daily_bars(ib, vix, "150 D")
     if len(bars) < VIX_LOOKBACK_DAYS:
         logger.warning("Histórico de VIX insuficiente para el percentil; se asume filtro NO superado")
         return False
@@ -265,117 +239,46 @@ async def get_equity(ib: IB):
 
 
 # ---------------------------------------------------------------------------
-# Escáner y ranking (PositionScore = 1/HV -> menor volatilidad primero)
+# Cribado del universo y ranking (PositionScore = 1/HV -> menor volatilidad primero)
 # ---------------------------------------------------------------------------
 
-async def scan_candidates(ib: IB):
-    sub = ScannerSubscription()
-    sub.instrument = "STK"
-    sub.locationCode = "STK.US.MAJOR"
-    sub.scanCode = "HIGH_VS_13W_HL"
-    filter_options = [
-        TagValue("priceAbove", "1"),
-        TagValue("priceBelow", "100"),
-        TagValue("lastVsEMAChangeRatio200Above", "0"),
-        TagValue("marketCapAbove1e6", "500"),
-        TagValue("avgVolumeAbove", "100000"),
-    ]
-    results = await ib.reqScannerDataAsync(sub, [], filter_options)
-    emit("scanner.result", scan_code=sub.scanCode, count=len(results))
-    logger.info("Scanner: %d contratos encontrados", len(results))
-    return results
+def load_universe(path=UNIVERSE_FILE):
+    return [line.strip() for line in path.read_text().splitlines() if line.strip() and not line.startswith("#")]
 
 
-async def rank_candidates(ib: IB, candidates):
-    async def hv_for(data):
-        contract = data.contractDetails.contract
-        hv = await compute_annualized_hv(ib, contract)
-        if not hv or hv <= 0:
-            return None
-        return (contract, hv)
+async def scan_candidates(ib: IB, symbols):
+    """Evalúa el AFL sobre las barras diarias de cada símbolo. Devuelve (contrato, barras, distancia del stop)."""
+    contracts = [Stock(symbol, "SMART", "USD") for symbol in symbols]
+    qualified = [c for c in await ib.qualifyContractsAsync(*contracts) if isinstance(c, Stock) and c.conId]
+    limit = asyncio.Semaphore(SCAN_CONCURRENCY)
 
-    results = await asyncio.gather(*(hv_for(d) for d in candidates))
-    ranked = [r for r in results if r is not None]
-    ranked.sort(key=lambda x: x[1])  # HV ascendente == PositionScore (1/HV) descendente
-    emit("scanner.ranked", candidates=len(candidates), ranked=len(ranked))
-    return ranked
+    async def evaluate(contract):
+        async with limit:
+            try:
+                bars = await get_daily_bars(ib, contract, HISTORY_DURATION)
+            except Exception:
+                logger.warning("%s: sin histórico diario", contract.symbol, exc_info=True)
+                return None
+        stop_distance = entry_signal(bars) if bars else None
+        return (contract, bars, stop_distance) if stop_distance else None
 
-
-# ---------------------------------------------------------------------------
-# Watchlist: detección de ruptura y del pullback de entrada
-# ---------------------------------------------------------------------------
-
-async def update_watch_entry(ib: IB, entry: dict, vix_filter_ok: bool):
-    contract = Stock(conId=entry["con_id"], exchange=entry["exchange"], currency=entry["currency"])
-    qualified = await ib.qualifyContractsAsync(contract)
-    if not qualified:
-        logger.warning("No se pudo cualificar %s, se descarta de la watchlist", entry["symbol"])
-        emit("signal.discarded", symbol=entry["symbol"], reason="not_qualified")
-        remove_watch_entry(entry["con_id"])
-        return
-
-    bars = await ib.reqHistoricalDataAsync(
-        contract, endDateTime="", durationStr="6 M", barSizeSetting="1 day",
-        whatToShow="TRADES", useRTH=True, formatDate=1,
-    )
-    if len(bars) < HH_LOOKBACK_DAYS + ATR_PERIOD + 2:
-        return
-
-    last = bars[-1]  # sesión más reciente ya cerrada (ayer, si el job corre por la mañana)
-
-    if entry["phase"] == "breakout_wait":
-        rolling_hh = get_rolling_hh(bars)
-        if rolling_hh is None:
-            return
-        if last.high > rolling_hh:  # H_breakout
-            atr_last = get_atr(bars[:-1])
-            if atr_last is None:
-                remove_watch_entry(entry["con_id"])
-                return
-            entry.update(
-                phase="entry_wait",
-                limit_buy=last.low - atr_last * ATR_MULTIPLIER,
-                days_in_window=0,
-            )
-            upsert_watch_entry(entry)
-            emit("signal.breakout", symbol=entry["symbol"], limit_buy=entry["limit_buy"], atr=atr_last)
-            logger.info("%s: ruptura de máximo de %d días; limit_buy=%.2f",
-                        entry["symbol"], HH_LOOKBACK_DAYS, entry["limit_buy"])
-        return
-
-    if entry["phase"] == "entry_wait":
-        entry["days_in_window"] += 1
-        touched = last.low < entry["limit_buy"]
-
-        if touched:
-            red_candle = last.close < last.open
-            if red_candle and vix_filter_ok:
-                atr_prev = get_atr(bars[:-2])  # ATR "del día anterior a la señal"
-                if atr_prev is not None:
-                    emit("signal.entry", symbol=entry["symbol"], limit_buy=entry["limit_buy"], close=last.close)
-                    await submit_entry_bracket(ib, contract, entry, atr_prev * ATR_MULTIPLIER, last.close)
-            else:
-                emit("signal.discarded", symbol=entry["symbol"], reason="no_red_candle_or_vix",
-                     red_candle=red_candle, vix_ok=vix_filter_ok)
-                logger.info("%s: tocó el nivel de compra pero faltó vela roja/VIX; se descarta",
-                            entry["symbol"])
-            remove_watch_entry(entry["con_id"])
-            return
-
-        if entry["days_in_window"] >= BREAKOUT_WINDOW_DAYS:
-            emit("signal.expired", symbol=entry["symbol"], days=entry["days_in_window"])
-            logger.info("%s: expiró la ventana de %d días sin tocar el nivel de entrada",
-                        entry["symbol"], BREAKOUT_WINDOW_DAYS)
-            remove_watch_entry(entry["con_id"])
-            return
-
-        upsert_watch_entry(entry)
+    signals = [s for s in await asyncio.gather(*(evaluate(c) for c in qualified)) if s is not None]
+    emit("scanner.result", universe=len(symbols), qualified=len(qualified), count=len(signals))
+    logger.info("Cribado: %d de %d símbolos dan señal de compra", len(signals), len(symbols))
+    return signals
 
 
-async def submit_entry_bracket(ib: IB, contract, entry: dict, stop_distance: float, reference_price: float):
-    """Envía de una vez: MOO de compra (ejecuta en la apertura de hoy) + stop
-    de protección como hija del MOO, usando reference_price (cierre del día
-    de la señal) como proxy del precio de entrada real."""
+def rank_candidates(signals):
+    ranked = [(signal, hv) for signal in signals if (hv := annualized_hv(signal[1]))]
+    ranked.sort(key=lambda item: item[1])  # HV ascendente == PositionScore (1/HV) descendente
+    emit("scanner.ranked", candidates=len(signals), ranked=len(ranked))
+    return [signal for signal, _hv in ranked]
+
+
+async def submit_entry_bracket(ib: IB, contract, entry: dict, stop_distance: float, reference_price: float,
+                               exit_threshold: float):
+    """Envía de una vez: MOO de compra (ejecuta en la apertura de hoy) + stop de protección y take profit como
+    hijas del MOO, usando reference_price (cierre del día de la señal) como proxy del precio de entrada real."""
     equity = await get_equity(ib)
     notional = equity * POSITION_SIZE_PCT_OF_EQUITY / 100
     if not reference_price or reference_price <= 0:
@@ -399,10 +302,16 @@ async def submit_entry_bracket(ib: IB, contract, entry: dict, stop_distance: flo
     stop.ocaGroup = oca_group
     stop.ocaType = OCA_TYPE
     stop.tif = "GTC"  # sin esto IB lo trata como DAY y la posición queda sin stop desde el segundo día
-    stop.transmit = True
+    stop.transmit = False
+
+    take_profit = build_take_profit_order(quantity, exit_threshold, oca_group)
+    take_profit.orderId = ib.client.getReqId()
+    take_profit.parentId = parent.orderId
+    take_profit.transmit = True  # la última hija transmite el bracket entero
 
     ib.placeOrder(contract, parent)
     ib.placeOrder(contract, stop)
+    ib.placeOrder(contract, take_profit)
 
     insert_position({
         "con_id": entry["con_id"],
@@ -410,67 +319,79 @@ async def submit_entry_bracket(ib: IB, contract, entry: dict, stop_distance: flo
         "exchange": entry["exchange"],
         "currency": entry["currency"],
         "stop_order_id": stop.orderId,
-        "exit_order_id": None,
+        "exit_order_id": take_profit.orderId,
         "entry_atr": stop_distance,
         "oca_group": oca_group,
     })
     emit("order.bracket", symbol=entry["symbol"], qty=quantity, stop_price=stop_price,
-         reference_price=reference_price, equity=equity)
+         take_profit=take_profit.lmtPrice, reference_price=reference_price, equity=equity)
     logger.info("%s: bracket enviado — MOO compra qty=%d, stop en %.2f (referencia %.2f)",
                 entry["symbol"], quantity, stop_price, reference_price)
 
 
 # ---------------------------------------------------------------------------
-# Posiciones abiertas: LOC de salida actualizada a diario + limpieza de tracking
+# Posiciones abiertas: take profit actualizado a diario + limpieza de tracking
 # ---------------------------------------------------------------------------
 
-def build_loc_order(action: str, quantity: int, limit_price: float, oca_group: str):
+def exit_threshold(bars):
+    """Umbral de Sell = C > Ref(HHV(C,2),-1): el máximo de los 2 cierres más recientes ya conocidos."""
+    return max(bars[-1].close, bars[-2].close)
+
+
+def build_take_profit_order(quantity: int, limit_price: float, oca_group: str):
     order = Order()
-    order.action = action
-    order.orderType = "LOC"
+    order.action = "SELL"
+    order.orderType = "LMT"
     order.totalQuantity = quantity
     order.lmtPrice = round(limit_price, 2)
-    order.tif = "DAY"
+    order.tif = "GTC"  # vive con la posición aunque el bot no se ejecute algún día
     order.ocaGroup = oca_group
     order.ocaType = OCA_TYPE
     return order
 
 
 async def update_exit_order(ib: IB, contract, pos: dict, quantity: int):
-    """Sell = C > Ref(HHV(C,2),-1): el umbral se calcula con los 2 cierres
-    más recientes ya conocidos y se manda/actualiza como límite de una LOC
-    para el cierre de hoy."""
-    bars = await ib.reqHistoricalDataAsync(
-        contract, endDateTime="", durationStr="5 D", barSizeSetting="1 day",
-        whatToShow="TRADES", useRTH=True, formatDate=1,
-    )
+    """Lleva el take profit al umbral de hoy. Uno vivo se modifica, nunca se cancela: cancelar un miembro de
+    un grupo OCA puede arrastrar al stop."""
+    bars = await get_daily_bars(ib, contract, "5 D")
     if len(bars) < 2:
         return
-    threshold = max(bars[-1].close, bars[-2].close)
+    threshold = exit_threshold(bars)
 
-    # Una LOC viva se modifica; una ya terminada no se puede reutilizar (IB: error 103, id duplicado).
-    live_ids = {trade.order.orderId for trade in ib.openTrades()}
-    order_id = pos["exit_order_id"] if pos["exit_order_id"] in live_ids else ib.client.getReqId()
-    order = build_loc_order("SELL", quantity, threshold, pos["oca_group"])
-    order.orderId = order_id
-    ib.placeOrder(contract, order)  # nueva orden si order_id es nuevo, modificación si ya existía
+    # El vivo se modifica sobre la orden que devuelve IB, que conserva su madre y su grupo.
+    # Uno terminado no se puede reutilizar (IB: error 103, id duplicado): se crea otro.
+    live = next((t.order for t in ib.openTrades() if t.order.orderId == pos["exit_order_id"]), None)
+    if live is not None:
+        order = live
+        order.lmtPrice = round(threshold, 2)
+        order.totalQuantity = quantity
+    else:
+        order = build_take_profit_order(quantity, threshold, pos["oca_group"])
+        order.orderId = ib.client.getReqId()
+    ib.placeOrder(contract, order)
 
-    if pos["exit_order_id"] != order_id:
-        update_position(pos["con_id"], exit_order_id=order_id)
+    if pos["exit_order_id"] != order.orderId:
+        update_position(pos["con_id"], exit_order_id=order.orderId)
     emit("order.exit_updated", symbol=pos["symbol"], limit=threshold, qty=quantity)
-    logger.info("%s: LOC de venta actualizada a %.2f para el cierre de hoy", pos["symbol"], threshold)
+    logger.info("%s: take profit en %.2f", pos["symbol"], threshold)
+
+
+def _emit_stop_missing(pos: dict, ib_pos, reason: str) -> None:
+    emit("position.stop_missing", level=logging.CRITICAL, symbol=pos["symbol"],
+         stop_order_id=pos["stop_order_id"], qty=ib_pos.position, reason=reason)
 
 
 async def replace_missing_stop(ib: IB, contract, pos: dict, ib_pos):
     """Repone el stop perdido al nivel de entrada real menos la distancia original, en un grupo OCA nuevo:
-    IB no admite reutilizar uno terminado, y la LOC de hoy entra en el mismo grupo que este stop.
-    Devuelve la orden enviada, o None si no se repuso. Mira todos los clientes: un stop ajeno también cuenta."""
+    IB no admite reutilizar uno terminado. El take profit del grupo viejo se cancela y update_exit_order crea
+    otro en el grupo nuevo, así que nunca quedan dos órdenes de venta sin OCA entre ellas.
+    Devuelve (stop enviado, take profit viejo cancelado o None), o None si no se repuso.
+    Mira todos los clientes: un stop ajeno también cuenta."""
     con_id = pos["con_id"]
     try:
         open_trades = await asyncio.wait_for(ib.reqAllOpenOrdersAsync(), OPEN_ORDERS_TIMEOUT_S)
     except TimeoutError:
-        emit("position.stop_missing", level=logging.CRITICAL, symbol=pos["symbol"],
-             stop_order_id=pos["stop_order_id"], qty=ib_pos.position, reason="IB no devolvió las órdenes")
+        _emit_stop_missing(pos, ib_pos, "IB no devolvió las órdenes")
         return None
     has_sell_stop = any(
         t.contract.conId == con_id and t.order.action == "SELL" and t.order.orderType.startswith("STP")
@@ -478,10 +399,13 @@ async def replace_missing_stop(ib: IB, contract, pos: dict, ib_pos):
     )
     stop_price = round(ib_pos.avgCost - (pos["entry_atr"] or 0), 2)
     if has_sell_stop or not pos["entry_atr"] or stop_price <= 0:
-        emit("position.stop_missing", level=logging.CRITICAL, symbol=pos["symbol"],
-             stop_order_id=pos["stop_order_id"], qty=ib_pos.position,
-             reason="otro stop de venta vivo" if has_sell_stop else "sin datos para calcular el nivel")
+        reason = "otro stop de venta vivo" if has_sell_stop else "sin datos para calcular el nivel"
+        _emit_stop_missing(pos, ib_pos, reason)
         return None
+
+    old_exit = next((t for t in ib.openTrades() if t.order.orderId == pos["exit_order_id"]), None)
+    if old_exit is not None:
+        ib.cancelOrder(old_exit.order)
 
     stop = StopOrder("SELL", int(ib_pos.position), stop_price)
     stop.orderId = ib.client.getReqId()
@@ -494,13 +418,13 @@ async def replace_missing_stop(ib: IB, contract, pos: dict, ib_pos):
     pos.update(stop_order_id=stop.orderId, oca_group=stop.ocaGroup, exit_order_id=None)
     emit("position.stop_replaced", level=logging.WARNING, symbol=pos["symbol"], order_id=stop.orderId,
          stop_price=stop_price, qty=ib_pos.position)
-    return trade
+    return trade, old_exit
 
 
 async def sync_positions(ib: IB):
     """Para cada posición en tracking: si ya no existe en IB (nunca llegó a
-    ejecutarse, o ya cerró por stop/LOC), se limpia. Si sigue abierta, se
-    actualiza su LOC de salida con el umbral de hoy."""
+    ejecutarse, o ya cerró por stop/take profit), se limpia. Si sigue abierta,
+    se actualiza su take profit con el umbral de hoy."""
     tracked = load_positions()
     # Sin una lista fresca de órdenes no se decide nada: cancelar o reponer a ciegas podría dejar sin stop o duplicarlo.
     try:
@@ -530,15 +454,15 @@ async def sync_positions(ib: IB):
     for pos in tracked:
         ib_pos = ib_positions.get(pos["con_id"])
         if ib_pos is None:
-            # Sin posición, un stop GTC vivo queda huérfano y al saltar abriría un corto.
-            # Con la compra madre aún viva no es huérfano: la entrada todavía no se ha ejecutado.
-            orphan = live_orders.get(pos["stop_order_id"])
-            if orphan is not None and orphan.parentId in live_orders:
+            # Sin posición, un stop o un take profit GTC vivo queda huérfano y al ejecutarse abriría un corto.
+            # Con la compra madre aún viva no lo es: la entrada todavía no se ha ejecutado.
+            orphans = [live_orders[i] for i in (pos["stop_order_id"], pos["exit_order_id"]) if i in live_orders]
+            if any(orphan.parentId in live_orders for orphan in orphans):
                 continue
-            if orphan is not None:
+            for orphan in orphans:
                 ib.cancelOrder(orphan)
-                emit("position.orphan_stop_cancelled", level=logging.WARNING, symbol=pos["symbol"],
-                     order_id=orphan.orderId)
+                emit("position.orphan_cancelled", level=logging.WARNING, symbol=pos["symbol"],
+                     order_id=orphan.orderId, order_type=orphan.orderType)
             logger.info("%s: sin posición abierta en IB; se limpia el tracking", pos["symbol"])
             emit("position.untracked", symbol=pos["symbol"], reason="no_position_in_ib")
             remove_position(pos["con_id"])
@@ -554,13 +478,16 @@ async def sync_positions(ib: IB):
             replaced = await replace_missing_stop(ib, contract, pos, ib_pos)
         await update_exit_order(ib, contract, pos, int(abs(ib_pos.position)))
 
-        # Sin probar contra IB: que el rechazo de la LOC o del propio stop lo mate debe saberse hoy, no mañana.
+        # Que IB rechace el stop repuesto, o no cancele el take profit viejo, debe saberse hoy, no mañana.
         if replaced is not None:
+            stop_trade, old_exit = replaced
             await asyncio.sleep(STOP_CHECK_DELAY_S)
-            if replaced.orderStatus.status in OrderStatus.DoneStates:
-                emit("position.stop_missing", level=logging.CRITICAL, symbol=pos["symbol"],
-                     stop_order_id=pos["stop_order_id"], qty=ib_pos.position,
-                     reason=f"stop repuesto terminado: {replaced.orderStatus.status}")
+            if stop_trade.orderStatus.status in OrderStatus.DoneStates:
+                _emit_stop_missing(pos, ib_pos, f"stop repuesto terminado: {stop_trade.orderStatus.status}")
+            if old_exit is not None and old_exit.orderStatus.status not in OrderStatus.DoneStates:
+                # Dos ventas sin OCA entre ellas: si se ejecutan las dos, queda un corto.
+                emit("position.exit_cancel_unconfirmed", level=logging.CRITICAL, symbol=pos["symbol"],
+                     order_id=old_exit.order.orderId, status=old_exit.orderStatus.status)
 
 async def is_trading_day(ib: IB) -> bool:
     """Comprueba si hoy hay sesión abierta usando el calendario de negociación
@@ -586,7 +513,7 @@ async def is_trading_day(ib: IB) -> bool:
 # Ejecución diaria (pensada para correr por la mañana, antes de la apertura)
 # ---------------------------------------------------------------------------
 
-async def run_once(ib: IB):
+async def run_once(ib: IB, universe=None):
     logger.info("=== Ejecución diaria iniciada (antes de la apertura) ===")
     assert_session_is_demo(ib)  # segunda barrera: también si se llama a run_once sin pasar por bot.py
     init_db()
@@ -596,79 +523,30 @@ async def run_once(ib: IB):
         emit("run.market_closed")
         return
 
-    # 1) Posiciones ya abiertas: limpiar tracking obsoleto y refrescar la LOC de salida
+    # 1) Posiciones ya abiertas: limpiar tracking obsoleto y llevar el take profit al umbral de hoy
     await sync_positions(ib)
 
     # 2) Filtro de VIX (percentil) para decidir si hoy se permiten entradas nuevas
     vix_ok = await get_vix_percentile_ok(ib)
 
-    # 3) Avanzar la watchlist (rupturas / pullbacks pendientes); las que disparan
-    #    compra mandan ya su bracket (MOO + stop) para la apertura de hoy
-    watchlist = load_watchlist()
-    logger.info("Watchlist actual: %d contratos", len(watchlist))
-    for entry in watchlist:
-        try:
-            await update_watch_entry(ib, entry, vix_ok)
-        except Exception:
-            emit("strategy.entry_error", level=logging.ERROR, exc_info=True, symbol=entry["symbol"])
-            logger.exception("Error procesando %s", entry["symbol"])
-
-    # 4) Si hay huecos, buscar candidatos nuevos
-    watchlist = load_watchlist()
-    occupied = len(load_positions()) + len(watchlist)
-    slots = MAX_POSITIONS - occupied
-    if slots <= 0:
-        logger.info("Sin huecos libres, no se buscan candidatos nuevos")
+    # 3) Cribado del universo: las señales mejor clasificadas mandan su bracket (MOO + stop) para hoy
+    positions = load_positions()
+    slots = MAX_POSITIONS - len(positions)
+    if slots <= 0 or not vix_ok:
+        logger.info("Sin entradas nuevas hoy: %d huecos libres, VIX %s", slots, "permite" if vix_ok else "bloquea")
         logger.info("=== Ejecución diaria terminada ===")
         return
 
-    candidates = await scan_candidates(ib)
-    ranked = await rank_candidates(ib, candidates)
-
-    existing_ids = {w["con_id"] for w in watchlist} | {p["con_id"] for p in load_positions()}
-    added = 0
-    for contract, _hv in ranked:
-        if added >= slots:
-            break
-        if contract.conId in existing_ids:
-            continue
-        bars = await ib.reqHistoricalDataAsync(
-            contract, endDateTime="", durationStr="6 M", barSizeSetting="1 day",
-            whatToShow="TRADES", useRTH=True, formatDate=1,
-        )
-        if len(bars) < HH_LOOKBACK_DAYS + ATR_PERIOD + 2:
-            continue
-        upsert_watch_entry({
-            "con_id": contract.conId,
-            "symbol": contract.symbol,
-            "exchange": contract.exchange or contract.primaryExchange,
-            "currency": contract.currency,
-            "phase": "breakout_wait",
-        })
-        added += 1
-
-    emit("watchlist.updated", added=added, size=len(load_watchlist()), positions=len(load_positions()))
-    logger.info("Añadidos %d candidatos nuevos a la watchlist", added)
-    logger.info("=== Ejecución diaria terminada ===")
-
-
-# ---------------------------------------------------------------------------
-# Punto de entrada para bot.py
-# ---------------------------------------------------------------------------
-
-async def strategy(ib: IB, run_immediately: bool = True):
-    """Pensado para un proceso persistente (bot.py): lanza run_once() y
-    luego espera 24h antes de repetir. Si prefieres invocarla desde un
-    cron externo (recomendado: por la mañana, antes de la apertura), no
-    uses esta función: llama a run_once(ib) directamente tras conectar y
-    desconecta al terminar.
-    """
-    if run_immediately:
-        await run_once(ib)
-
-    while True:
-        await asyncio.sleep(24 * 60 * 60)
+    held = {p["con_id"] for p in positions}
+    signals = [s for s in await scan_candidates(ib, universe or load_universe()) if s[0].conId not in held]
+    for contract, bars, stop_distance in rank_candidates(signals)[:slots]:
+        entry = {"con_id": contract.conId, "symbol": contract.symbol, "exchange": contract.exchange or "SMART",
+                 "currency": contract.currency}
         try:
-            await run_once(ib)
+            emit("signal.entry", symbol=contract.symbol, close=bars[-1].close, stop_distance=stop_distance)
+            await submit_entry_bracket(ib, contract, entry, stop_distance, bars[-1].close, exit_threshold(bars))
         except Exception:
-            logger.exception("Fallo en la ejecución diaria de la estrategia")
+            emit("strategy.entry_error", level=logging.ERROR, exc_info=True, symbol=contract.symbol)
+            logger.exception("Error enviando la entrada de %s", contract.symbol)
+
+    logger.info("=== Ejecución diaria terminada ===")

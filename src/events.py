@@ -2,7 +2,6 @@
 
 Archivo: log/events.jsonl, rotado a medianoche UTC a log/events.jsonl.AAAA-MM-DD.
 Cada línea es un objeto con: ts (ISO-8601 UTC), level, event, run_id, schema y los campos del evento.
-El catálogo de eventos está documentado en CLAUDE.md.
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ DEFAULT_LOG_DIR = Path(__file__).resolve().parents[1] / "log"
 LOG_FILE = "events.jsonl"
 
 _RESERVED = {"ts", "level", "event", "run_id", "schema"}
-_SECRET_KEY = re.compile(r"pass|secret|token|credential|api_?key", re.I)
+_SECRET_KEY = re.compile(r"pass(?!ed\b)|secret|token|credential|api_?key", re.I)  # "guard.passed" no es secreto
 _ACCOUNT_ID = re.compile(r"\b([DU][A-Z]{0,3})\d{3,6}(\d{3})\b")
 
 _logger = logging.getLogger("tradingbot.events")
@@ -141,15 +140,15 @@ def timed(op: str, /, **fields: Any) -> Iterator[None]:
 
 
 def _latency_summary() -> dict[str, dict[str, float]]:
-    summary = {}
-    for op, samples in sorted(_stats.latencies.items()):
-        summary[op] = {
+    return {
+        op: {
             "n": len(samples),
             "p50_ms": statistics.median(samples),
             "max_ms": max(samples),
             "total_ms": round(sum(samples), 1),
         }
-    return summary
+        for op, samples in sorted(_stats.latencies.items())
+    }
 
 
 def emit_daily_summary(status: str, **fields: Any) -> dict[str, Any]:

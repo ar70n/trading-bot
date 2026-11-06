@@ -6,7 +6,6 @@ ObservedIB envuelve a IB y delega todo lo demás, de modo que strategy.py recibe
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
 from typing import Any
 
 from demo_guard import assert_order_is_demo
@@ -64,16 +63,14 @@ class ObservedIB:
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self._ib, name)
-        if name.endswith("Async") and callable(attr):
-            return self._timed_call(name, attr)
-        return attr
+        if not (name.endswith("Async") and callable(attr)):
+            return attr
 
-    def _timed_call(self, name: str, call: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
-        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        async def timed_call(*args: Any, **kwargs: Any) -> Any:
             with timed(f"ib.{name}", symbol=_symbol(args[0]) if args else None):
-                return await call(*args, **kwargs)
+                return await attr(*args, **kwargs)
 
-        return wrapper
+        return timed_call
 
     def placeOrder(self, contract: Any, order: Any) -> Any:  # noqa: N802 - misma API que ib_async
         assert_order_is_demo(order)
